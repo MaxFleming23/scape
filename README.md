@@ -3,6 +3,8 @@
 > /skeɪp/
 > To absquatulate from structure. To scamper across the void.
 
+![Screenshot of Scape](pic-full-251126-2012-32.png)
+
 scape is an infinite, spatial text editor, form uncloaked.
 Only the relative distance between thoughts.
 Lives in symbiosis with Vimwiki.
