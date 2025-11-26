@@ -1,0 +1,490 @@
+#!/bin/bash
+
+# --- Configuration ---
+WIKI_ROOT="$HOME/.local/share/nvim/vimwiki"
+LOG_DIR="$WIKI_ROOT/logs"
+WORD_DIR="$WIKI_ROOT/words"
+
+# Ensure directories exist
+mkdir -p "$LOG_DIR"
+mkdir -p "$WORD_DIR"
+
+# --- Constants for ANSI Speed ---
+ESC=$'\e'
+CSI="${ESC}["
+HIDE_CURSOR="${CSI}?25l"
+SHOW_CURSOR="${CSI}?25h"
+CLEAR_SCREEN="${CSI}2J"
+HOME_CURSOR="${CSI}H"
+RESET_COLOR="${CSI}0m"
+
+# --- Global Buffer ---
+frame_buffer=""
+
+# --- Functions ---
+
+# Appends to the global frame buffer
+queue_draw() {
+    local y=$1
+    local x=$2
+    local str=$3
+    local color=$4
+
+    local ansi_y=$((y + 1))
+    local ansi_x=$((x + 1))
+
+    if [[ -n "$color" ]]; then
+        frame_buffer+="${CSI}${ansi_y};${ansi_x}H${CSI}48;5;${color}m${str}${RESET_COLOR}"
+    else
+        frame_buffer+="${CSI}${ansi_y};${ansi_x}H${str}"
+    fi
+}
+
+draw_block() {
+    local screen_y=$(( $1 - camera_y ))
+    local screen_x=$(( $2 - camera_x ))
+    local color=240
+
+    if (( screen_y >= 0 && screen_y < term_height && screen_x >= 0 && screen_x < term_width )); then
+        if [[ "$mode" == "insert" ]]; then
+            color=202
+        elif [[ "$mode" == "visual" ]]; then
+            color=57
+        fi
+
+        local key="$1,$2"
+        local char=" "
+
+        if [[ "$mode" != "insert" && -n "${grid_data[$key]}" ]]; then
+            char="${grid_data[$key]}"
+        fi
+
+        queue_draw "$screen_y" "$screen_x" "$char" "$color"
+    fi
+}
+
+draw_grid() {
+    for key in "${!grid_data[@]}"; do
+        local abs_y="${key%,*}"
+        local abs_x="${key#*,}"
+
+        local screen_y=$(( abs_y - camera_y ))
+        local screen_x=$(( abs_x - camera_x ))
+
+        if (( screen_y >= 0 && screen_y < term_height && screen_x >= 0 && screen_x < term_width )); then
+            if ! (( abs_y == y && abs_x == x )); then
+                if [[ -n "${grid_data[$key]}" ]]; then
+                    frame_buffer+="${CSI}$((screen_y + 1));$((screen_x + 1))H${grid_data[$key]}"
+                fi
+            fi
+        fi
+    done
+}
+
+draw_selection() {
+    if [[ "$mode" != "visual" ]]; then return; fi
+
+    local min_y=$(( y < visual_start_y ? y : visual_start_y ))
+    local max_y=$(( y > visual_start_y ? y : visual_start_y ))
+    local min_x=$(( x < visual_start_x ? x : visual_start_x ))
+    local max_x=$(( x > visual_start_x ? x : visual_start_x ))
+
+    local start_r=$(( min_y < camera_y ? camera_y : min_y ))
+    local end_r=$(( max_y > (camera_y + term_height - 1) ? (camera_y + term_height - 1) : max_y ))
+    local start_c=$(( min_x < camera_x ? camera_x : min_x ))
+    local end_c=$(( max_x > (camera_x + term_width - 1) ? (camera_x + term_width - 1) : max_x ))
+
+    for (( r=start_r; r<=end_r; r++ )); do
+        for (( c=start_c; c<=end_c; c++ )); do
+            if (( r == y && c == x )); then continue; fi
+
+            local screen_y=$(( r - camera_y ))
+            local screen_x=$(( c - camera_x ))
+
+            local char="${grid_data[$r,$c]}"
+            if [[ -z "$char" ]]; then char=" "; fi
+
+            queue_draw "$screen_y" "$screen_x" "$char" "57"
+        done
+    done
+}
+
+# --- History Functions (Undo/Redo) ---
+
+save_state() {
+    undo_stack+=("$(declare -p grid_data)")
+    redo_stack=()
+}
+
+perform_undo() {
+    if [[ ${#undo_stack[@]} -eq 0 ]]; then
+        status_message="Already at oldest change"
+        return
+    fi
+    redo_stack+=("$(declare -p grid_data)")
+    local last_idx=$((${#undo_stack[@]} - 1))
+    local prev_state="${undo_stack[$last_idx]}"
+    unset 'undo_stack[last_idx]'
+    eval "${prev_state/declare -A/declare -gA}"
+    status_message="Undo"
+}
+
+perform_redo() {
+    if [[ ${#redo_stack[@]} -eq 0 ]]; then
+        status_message="Already at newest change"
+        return
+    fi
+    undo_stack+=("$(declare -p grid_data)")
+    local last_idx=$((${#redo_stack[@]} - 1))
+    local next_state="${redo_stack[$last_idx]}"
+    unset 'redo_stack[last_idx]'
+    eval "${next_state/declare -A/declare -gA}"
+    status_message="Redo"
+}
+
+# --- Action Functions ---
+
+delete_selection() {
+    save_state
+    clipboard=()
+    if [[ "$mode" == "normal" ]]; then
+        local char="${grid_data[$y,$x]}"
+        if [[ -n "$char" ]]; then
+            clipboard+=("0,0:$char")
+            unset "grid_data[$y,$x]"
+        fi
+    elif [[ "$mode" == "visual" ]]; then
+        local min_y=$(( y < visual_start_y ? y : visual_start_y ))
+        local max_y=$(( y > visual_start_y ? y : visual_start_y ))
+        local min_x=$(( x < visual_start_x ? x : visual_start_x ))
+        local max_x=$(( x > visual_start_x ? x : visual_start_x ))
+
+        for (( r=min_y; r<=max_y; r++ )); do
+            for (( c=min_x; c<=max_x; c++ )); do
+                local char="${grid_data[$r,$c]}"
+                if [[ -n "$char" ]]; then
+                    clipboard+=("$((r-min_y)),$((c-min_x)):$char")
+                    unset "grid_data[$r,$c]"
+                fi
+            done
+        done
+        mode="normal"
+    fi
+}
+
+paste_clipboard() {
+    save_state
+    for item in "${clipboard[@]}"; do
+        local coords="${item%:*}"
+        local char="${item#*:}"
+        local rel_y="${coords%,*}"
+        local rel_x="${coords#*,}"
+        grid_data["$((y+rel_y)),$((x+rel_x))"]="$char"
+    done
+}
+
+# --- File Operations ---
+
+select_and_open() {
+    local target_dir="$1"
+    printf "${SHOW_CURSOR}${CLEAR_SCREEN}${HOME_CURSOR}"
+    stty echo
+
+    echo "Select a file to open (Ctrl+C to cancel):"
+    local files=("$target_dir"/*.md)
+    if [[ ! -e "${files[0]}" ]]; then
+        echo "No files found in $target_dir"
+        read -n 1 -s -r -p "Press any key to return..."
+        return
+    fi
+    local options=()
+    for f in "${files[@]}"; do options+=("$(basename "$f")"); done
+
+    select opt in "${options[@]}"; do
+        if [[ -n "$opt" ]]; then
+            nvim "$target_dir/$opt"
+            break
+        fi
+    done
+    stty -echo
+    printf "${HIDE_CURSOR}"
+}
+
+show_context_menu() {
+    local menu_y=$((term_height / 2 - 4))
+    local menu_x=$((term_width / 2 - 15))
+
+    local menu_buffer=""
+    for ((i=0; i<8; i++)); do
+        menu_buffer+="${CSI}$((menu_y + i + 1));$((menu_x + 1))H                        "
+    done
+
+    menu_buffer+="${CSI}$((menu_y + 1));$((menu_x + 1))H--- MENU ---"
+    menu_buffer+="${CSI}$((menu_y + 2));$((menu_x + 1))H l - New Log Entry"
+    menu_buffer+="${CSI}$((menu_y + 3));$((menu_x + 1))H L - List Logs"
+    menu_buffer+="${CSI}$((menu_y + 4));$((menu_x + 1))H w - New Word Note"
+    menu_buffer+="${CSI}$((menu_y + 5));$((menu_x + 1))H W - List Word Notes"
+    menu_buffer+="${CSI}$((menu_y + 6));$((menu_x + 1))H q - Cancel"
+
+    printf "%s" "$menu_buffer"
+
+    IFS= read -rsn1 choice
+
+    case "$choice" in
+        l)
+            local timestamp=$(date +"%Y_%m_%d_%H%M")
+            local filepath="$LOG_DIR/${timestamp}.md"
+            printf "${SHOW_CURSOR}${CLEAR_SCREEN}${HOME_CURSOR}"
+            stty echo; nvim "$filepath"; stty -echo
+            ;;
+        L) select_and_open "$LOG_DIR" ;;
+        w)
+            printf "${CSI}$((menu_y + 7));$((menu_x + 1))HEnter word: ${SHOW_CURSOR}"
+            stty echo
+            read -r word_title
+            stty -echo
+            if [[ -n "$word_title" ]]; then
+                local filepath="$WORD_DIR/${word_title}.md"
+                printf "${CLEAR_SCREEN}${HOME_CURSOR}"
+                stty echo; nvim "$filepath"; stty -echo
+            fi
+            ;;
+        W) select_and_open "$WORD_DIR" ;;
+        q) ;;
+    esac
+    printf "${HIDE_CURSOR}"
+}
+
+handle_enter_key() {
+    if [[ -n "${grid_data[$y,$x]}" ]]; then
+        local start_x=$x
+        while [[ -n "${grid_data[$y,$((start_x - 1))]}" ]]; do ((start_x--)); done
+        local filename=""
+        local curr_x=$start_x
+        while [[ -n "${grid_data[$y,$curr_x]}" ]]; do
+            filename+="${grid_data[$y,$curr_x]}"
+            ((curr_x++))
+        done
+
+        printf "${SHOW_CURSOR}${CLEAR_SCREEN}${HOME_CURSOR}"
+        local wiki_path="$WIKI_ROOT/${filename}.md"
+        mkdir -p "$(dirname "$wiki_path")"
+        stty echo; nvim "$wiki_path"; stty -echo
+        printf "${HIDE_CURSOR}"
+    else
+        show_context_menu
+    fi
+}
+
+# --- IO Functions ---
+
+load_grid() {
+    local file_path="$WIKI_ROOT/letter_grid.md"
+    if [[ ! -f "$file_path" ]]; then return; fi
+    while read -r line; do
+        if [[ "$line" == word:* ]]; then
+            word=$(echo "$line" | sed -n "s/word: '\([^']*\)'.*/\1/p")
+            y_coord=$(echo "$line" | sed -n "s/.*y:\(-*[0-9]*\).*/\1/p")
+            x_coord=$(echo "$line" | sed -n "s/.*x:\(-*[0-9]*\).*/\1/p")
+            if [[ -n "$word" && -n "$y_coord" && -n "$x_coord" ]]; then
+                for (( i=0; i<${#word}; i++ )); do
+                    grid_data["$y_coord,$((x_coord + i))"]="${word:$i:1}"
+                done
+            fi
+        elif [[ "$line" == char:* ]]; then
+            char=$(echo "$line" | sed -n "s/char: '\(.\)'.*/\1/p")
+            y_coord=$(echo "$line" | sed -n "s/.*y:\(-*[0-9]*\).*/\1/p")
+            x_coord=$(echo "$line" | sed -n "s/.*x:\(-*[0-9]*\).*/\1/p")
+            if [[ -n "$char" && -n "$y_coord" && -n "$x_coord" ]]; then
+                grid_data["$y_coord,$x_coord"]="$char"
+            fi
+        fi
+    done < "$file_path"
+}
+
+save_grid() {
+    local file_path="$WIKI_ROOT/letter_grid.md"
+    mkdir -p "$(dirname "$file_path")"
+    > "$file_path"
+    declare -A visited
+    sorted_keys=$(printf '%s\n' "${!grid_data[@]}" | sort -t, -k1,1n -k2,2n)
+
+    for key in $sorted_keys; do
+        if [[ -n "${visited[$key]}" ]]; then continue; fi
+        if [[ -z "${grid_data[$key]}" ]]; then continue; fi
+
+        local y_coord="${key%,*}"
+        local x_coord="${key#*,}"
+        local word="${grid_data[$key]}"
+        visited[$key]=1
+        local next_x=$((x_coord + 1))
+
+        while [[ -n "${grid_data[$y_coord,$next_x]}" ]]; do
+            word+="${grid_data[$y_coord,$next_x]}"
+            visited["$y_coord,$next_x"]=1
+            ((next_x++))
+        done
+
+        if [[ -n "$word" ]]; then
+            if (( ${#word} == 1 )); then
+                 echo "char: '$word', location: (y:$y_coord, x:$x_coord)" >> "$file_path"
+            else
+                 echo "word: '$word', location: (y:$y_coord, x:$x_coord)" >> "$file_path"
+            fi
+        fi
+    done
+    status_message="File saved to $file_path"
+}
+
+recenter_camera() {
+    camera_y=$(( y - term_height / 2 ))
+    camera_x=$(( x - term_width / 2 ))
+}
+
+get_term_size() { read -r term_height term_width < <(stty size); }
+
+cleanup() {
+    printf "${SHOW_CURSOR}${CLEAR_SCREEN}${HOME_CURSOR}"
+    stty echo
+    exit 0
+}
+
+# --- Initial Setup ---
+trap cleanup INT
+trap 'get_term_size; recenter_camera' WINCH
+stty -echo
+printf "${HIDE_CURSOR}"
+get_term_size
+
+declare -A grid_data
+declare -a clipboard
+declare -a undo_stack
+declare -a redo_stack
+
+mode="normal"
+y=0; x=0
+camera_y=0; camera_x=0
+visual_start_y=0; visual_start_x=0
+status_message=""
+
+load_grid
+recenter_camera
+
+# --- Main Loop ---
+while true; do
+    # --- RENDER PHASE ---
+    frame_buffer="${CLEAR_SCREEN}${HOME_CURSOR}"
+    draw_grid
+    draw_selection
+    draw_block "$y" "$x"
+
+    if [[ -n "$status_message" ]]; then
+         frame_buffer+="${CSI}${term_height};1H${RESET_COLOR}${status_message}"
+         status_message=""
+    fi
+
+    printf "%b" "$frame_buffer"
+
+    # --- INPUT PHASE ---
+
+    if [[ "$mode" == "command" ]]; then
+        printf "${CSI}${term_height};1H${CSI}K:"
+        printf "${SHOW_CURSOR}"
+
+        cmd_str=""
+        while true; do
+            IFS= read -rsn1 char
+            if [[ -z "$char" ]]; then break; fi
+            if [[ "$char" == $'\x7f' || "$char" == $'\x08' ]]; then
+                if [[ ${#cmd_str} -gt 0 ]]; then
+                    cmd_str="${cmd_str%?}"
+                    printf "\b \b"
+                fi
+                continue
+            fi
+            if [[ "$char" == $'\e' ]]; then cmd_str=""; break; fi
+
+            if [[ "$char" =~ ^[[:print:]]$ ]]; then
+                cmd_str+="$char"
+                printf "%s" "$char"
+            fi
+        done
+
+        printf "${HIDE_CURSOR}"
+        cmd="$cmd_str"
+
+        if [[ "$cmd" == "w" ]]; then save_grid
+        elif [[ "$cmd" == "q" ]]; then cleanup
+        elif [[ "$cmd" == "wq" || "$cmd" == "x" ]]; then save_grid; cleanup
+        elif [[ -n "$cmd" ]]; then status_message="Unknown command: $cmd"; fi
+        mode="normal"
+
+    else
+        IFS= read -rsn1 input
+
+        # Undo (u) and Redo (Ctrl+r / \x12) in Normal Mode
+        if [[ "$mode" == "normal" ]]; then
+             if [[ "$input" == "u" ]]; then
+                 perform_undo
+                 continue
+             elif [[ "$input" == $'\x12' ]]; then # Ctrl+r
+                 perform_redo
+                 continue
+             fi
+        fi
+
+        if [[ "$input" == $'\e' ]]; then
+            mode="normal"
+            continue
+        fi
+
+        case "$mode" in
+            normal)
+                case "$input" in
+                    h) ((x--));;
+                    j) ((y++));;
+                    k) ((y--));;
+                    l) ((x++));;
+                    i)
+                       save_state
+                       mode="insert"
+                       ;;
+                    v) mode="visual"; visual_start_y=$y; visual_start_x=$x ;;
+                    x) delete_selection;;
+                    p) paste_clipboard;;
+                    :) mode="command";;
+                    "") handle_enter_key;;
+                    q) cleanup;;
+                esac
+                ;;
+            visual)
+                case "$input" in
+                    h) ((x--));;
+                    j) ((y++));;
+                    k) ((y--));;
+                    l) ((x++));;
+                    d|x) delete_selection;;
+                    v) mode="normal";;
+                esac
+                ;;
+            insert)
+                # Handle Backspace
+                if [[ "$input" == $'\x7f' || "$input" == $'\x08' ]]; then
+                    ((x--))
+                    unset "grid_data[$y,$x]"
+                # Handle Space: Clear current cell and move right
+                elif [[ "$input" == " " ]]; then
+                    unset "grid_data[$y,$x]"
+                    ((x++))
+                # Handle other printable characters
+                elif [[ "$input" =~ ^[[:print:]]$ ]]; then
+                    grid_data["$y,$x"]="$input"
+                    ((x++))
+                fi
+                ;;
+        esac
+    fi
+
+    # Camera Follow
+    recenter_camera
+done
