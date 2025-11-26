@@ -12,16 +12,16 @@ Lives in symbiosis with Vimwiki.
 ## Mechanics
 
 - `h j k l`   : Glide across the infinite.
-- `i`         : Insert form.
-- `v`         : Visual mode. Shape the void.
+- `i`         : Insert.
+- `v`         : Visual mode.
 - `x` / `p`   : Delete. Paste.
-- `u` / `^r`  : Undo time. Redo fate.
+- `u` / `^r`  : Undo. Redo.
 
 - `Enter` (on word)  : Penetrate into that thought.
 - `Enter` (on void)  : Access context (Logs, Words).
 
-- `:`         : Summon the prompt.
-- `w`       : Save state.
+- `:`         : Pprompt.
+- `w`       : Save.
 - `q`       : Vamoose.
 
 ## License
