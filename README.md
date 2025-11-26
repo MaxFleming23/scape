@@ -1,7 +1,7 @@
 # scape
 
 > /skeɪp/
-> To absquatulate from structure. To scamper across the void.
+> Absquatulate cloaked form. To scamper across the void.
 
 ![Screenshot of Scape](pic-full-251126-2012-32.png)
 
